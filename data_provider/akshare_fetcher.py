@@ -1572,18 +1572,24 @@ class AkshareFetcher(BaseFetcher):
             circuit_breaker.record_failure(sina_key, str(e))
             return None
     
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=3, max=30),
+        retry=retry_if_exception_type((ConnectionError, TimeoutError)),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+    )
     def get_chip_distribution(self, stock_code: str) -> Optional[ChipDistribution]:
         """
         获取筹码分布数据
-        
+
         数据来源：ak.stock_cyq_em()
         包含：获利比例、平均成本、筹码集中度
-        
+
         注意：ETF/指数没有筹码分布数据，会直接返回 None
-        
+
         Args:
             stock_code: 股票代码
-            
+
         Returns:
             ChipDistribution 对象（最新一天的数据），获取失败返回 None
         """
