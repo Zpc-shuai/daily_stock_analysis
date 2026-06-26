@@ -237,6 +237,84 @@ def _build_dividend_payload(
     }
 
 
+def _extract_abstract_indicator_row(df: pd.DataFrame, stock_code: str) -> Optional[pd.Series]:
+    """
+    Handle stock_financial_abstract "wide" format where rows are indicators
+    and columns are date strings (20260331, 20251231, ...).
+    
+    Returns a Series with indicator names as index and latest values,
+    plus computed YoY growth rates, compatible with _pick_by_keywords.
+    """
+    if df is None or df.empty:
+        return None
+
+    # Find the indicator column (usually "指标" or similar)
+    indicator_col = None
+    date_cols = []
+    for col in df.columns:
+        col_s = str(col)
+        if col_s in ("指标", "选项"):
+            indicator_col = col
+        elif re.match(r'^\d{8}$', col_s):
+            date_cols.append(col)
+
+    if indicator_col is None or not date_cols:
+        return None
+
+    # Sort date columns descending
+    date_cols_sorted = sorted(date_cols, reverse=True)
+    latest_date_col = date_cols_sorted[0]
+
+    # Build a Series with indicator name -> latest value
+    result_data = {}
+    for _, row in df.iterrows():
+        indicator_name = str(row[indicator_col]).strip()
+        val = row[latest_date_col]
+        result_data[indicator_name] = val
+
+    # Compute YoY growth: find same quarter last year
+    latest_date = latest_date_col  # e.g. "20260331"
+    try:
+        year = int(latest_date[:4])
+        month_day = latest_date[4:]
+        prev_year_date = f"{year - 1}{month_day}"
+        if prev_year_date in date_cols:
+            for _, row in df.iterrows():
+                indicator_name = str(row[indicator_col]).strip()
+                prev_val = row[prev_year_date]
+                cur_val = result_data.get(indicator_name)
+                if prev_val is not None and cur_val is not None:
+                    try:
+                        prev_f = float(prev_val)
+                        cur_f = float(cur_val)
+                        if prev_f != 0:
+                            yoy_pct = round((cur_f - prev_f) / abs(prev_f) * 100, 2)
+                        else:
+                            yoy_pct = None
+                    except (ValueError, TypeError):
+                        yoy_pct = None
+                    result_data[f"{indicator_name}同比"] = yoy_pct
+    except (ValueError, IndexError):
+        pass
+
+    # Map common indicator names to expected keywords for _pick_by_keywords
+    # _pick_by_keywords matches by column NAME, so add mapped columns
+    name_mapping = {
+        "营业总收入": ["营业收入同比", "营收同比"],
+        "归母净利润": ["净利润同比", "净利同比"],
+    }
+    for src_name, target_names in name_mapping.items():
+        yoy_val = result_data.get(f"{src_name}同比")
+        if yoy_val is not None:
+            for tn in target_names:
+                result_data[tn] = yoy_val
+
+    # Also add the date info
+    result_data["报告期"] = latest_date_col
+
+    return pd.Series(result_data)
+
+
 def _extract_latest_row(df: pd.DataFrame, stock_code: str) -> Optional[pd.Series]:
     """
     Select the most relevant row for the given stock.
@@ -310,7 +388,11 @@ class AkshareFundamentalAdapter:
         ])
         result["errors"].extend(fin_errors)
         if fin_df is not None:
-            row = _extract_latest_row(fin_df, stock_code)
+            # Handle stock_financial_abstract "wide" format (rows=indicators, cols=dates)
+            if fin_source == "stock_financial_abstract":
+                row = _extract_abstract_indicator_row(fin_df, stock_code)
+            else:
+                row = _extract_latest_row(fin_df, stock_code)
             if row is not None:
                 revenue_yoy = _safe_float(_pick_by_keywords(row, ["营业收入同比", "营收同比", "收入同比", "同比增长"]))
                 profit_yoy = _safe_float(_pick_by_keywords(row, ["净利润同比", "净利同比", "归母净利润同比"]))
