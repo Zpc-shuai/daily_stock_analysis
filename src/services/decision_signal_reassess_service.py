@@ -7,7 +7,9 @@ import re
 from collections.abc import Mapping
 from typing import Any, Optional
 
-from src.schemas.decision_action import build_action_fields
+from src.schemas.decision_action import build_action_fields, normalize_decision_action
+from src.schemas.decision_profile import normalize_decision_profile
+from src.schemas.decision_scale import action_for_score, score_action_conflicts_without_guardrail
 from src.services.decision_profile_policy import (
     PROFILE_POLICY_VERSION,
     SCORING_VERSION,
@@ -22,8 +24,7 @@ from src.utils.sniper_points import find_sniper_points, parse_sniper_value
 
 
 UNSUPPORTED_PERSIST_MESSAGE = (
-    "Persisting reassessed decision_profile signals requires decision_profile "
-    "to be promoted to a first-class field."
+    "Persisting reassessed decision_profile signals is tracked by #1757."
 )
 
 
@@ -58,6 +59,9 @@ class DecisionSignalReassessService:
     ) -> dict[str, Any]:
         if persist:
             raise DecisionSignalReassessUnsupportedOperationError(UNSUPPORTED_PERSIST_MESSAGE)
+        decision_profile_norm = normalize_decision_profile(decision_profile)
+        if decision_profile_norm is None:
+            raise ValueError("decision_profile is required")
 
         record = self.db.get_analysis_history_by_id(source_report_id)
         if record is None:
@@ -76,12 +80,12 @@ class DecisionSignalReassessService:
         )
         policy = apply_decision_profile_policy(
             candidate,
-            decision_profile=decision_profile,
+            decision_profile=decision_profile_norm,
             data_quality_level=data_quality_level,
         )
         preview_candidate = policy.candidate
         metadata = {
-            "decision_profile": decision_profile,
+            "decision_profile": decision_profile_norm,
             "profile_source": "user_selected",
             "profile_policy_version": PROFILE_POLICY_VERSION,
             "signal_generation_version": SIGNAL_GENERATION_VERSION,
@@ -128,6 +132,15 @@ def _build_candidate(
     if not raw_code or not market:
         raise DecisionSignalUnsupportedReportSnapshotError("source report has no supported stock identity")
 
+    dashboard = _as_mapping(raw_result.get("dashboard"))
+    score = _effective_signal_score(
+        _score_from_value(_first_present(raw_result.get("sentiment_score"), getattr(record, "sentiment_score", None))),
+        dashboard=dashboard,
+    )
+    raw_action = normalize_decision_action(raw_result.get("action")) or normalize_decision_action(
+        _first_present(raw_result.get("operation_advice"), getattr(record, "operation_advice", None))
+    )
+    guardrail_reason = _extract_guardrail_reason(raw_result, score=score, raw_action=raw_action)
     action_fields = build_action_fields(
         operation_advice=_first_present(
             raw_result.get("operation_advice"),
@@ -136,6 +149,9 @@ def _build_candidate(
         explicit_action=raw_result.get("action"),
         report_type=report_type,
         report_language=raw_result.get("report_language"),
+        sentiment_score=score,
+        guardrail_reason=guardrail_reason,
+        align_with_score=True,
     )
     action = action_fields.get("action")
     if not action:
@@ -149,7 +165,7 @@ def _build_candidate(
     market_phase = _extract_market_phase(raw_result, context_snapshot)
     return DecisionSignalCandidate(
         action=action,
-        score=_score_from_value(_first_present(raw_result.get("sentiment_score"), getattr(record, "sentiment_score", None))),
+        score=score,
         confidence=_confidence_from_level(raw_result.get("confidence_level")),
         horizon=_extract_horizon(raw_result, context_snapshot, market_phase, action),
         entry_low=entry_low,
@@ -167,6 +183,10 @@ def _build_candidate(
         watch_conditions=_extract_watch_conditions(raw_result),
         market_phase=market_phase,
     )
+
+
+def _as_mapping(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
 
 
 def _parse_mapping(value: Any) -> Mapping[str, Any]:
@@ -232,6 +252,76 @@ def _score_from_value(value: Any) -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return score if 0 <= score <= 100 else None
+
+
+def _effective_signal_score(
+    score: Optional[int],
+    *,
+    dashboard: Mapping[str, Any],
+) -> Optional[int]:
+    calibration = _as_mapping(dashboard.get("decision_score_calibration"))
+    adjusted = _score_from_value(calibration.get("adjusted_score"))
+    return adjusted if adjusted is not None else score
+
+
+def _extract_guardrail_reason(
+    raw_result: Mapping[str, Any],
+    *,
+    score: Optional[int],
+    raw_action: Optional[str],
+) -> Optional[str]:
+    dashboard = raw_result.get("dashboard") if isinstance(raw_result.get("dashboard"), Mapping) else {}
+    calibration = (
+        dashboard.get("decision_score_calibration")
+        if isinstance(dashboard.get("decision_score_calibration"), Mapping)
+        else {}
+    )
+    stability = (
+        dashboard.get("decision_stability")
+        if isinstance(dashboard.get("decision_stability"), Mapping)
+        else {}
+    )
+    for candidate in (
+        calibration.get("guardrail_reason"),
+        stability.get("reason"),
+        raw_result.get("guardrail_reason"),
+    ):
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    if score_action_conflicts_without_guardrail(score=score, action=raw_action):
+        candidates = [raw_result.get("operation_advice")]
+        if action_for_score(score) == "buy":
+            candidates.extend(
+                [
+                    raw_result.get("analysis_summary"),
+                    raw_result.get("buy_reason"),
+                    raw_result.get("risk_warning"),
+                ]
+            )
+        hints = (
+            "等待",
+            "待",
+            "需要确认",
+            "缺少确认",
+            "未确认",
+            "回踩",
+            "支撑",
+            "压力",
+            "风险",
+            "资金",
+            "突破",
+            "不追",
+            "不宜",
+        )
+        for candidate in candidates:
+            text = str(candidate or "").strip()
+            if not text:
+                continue
+            normalized = text.lower()
+            if any(hint in normalized for hint in hints):
+                return text
+    return None
 
 
 def _confidence_from_level(value: Any) -> Optional[float]:
